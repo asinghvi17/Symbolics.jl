@@ -202,6 +202,7 @@ Clear caches of all cached functions involved in computing derivatives.
 function clear_derivative_caches!() # public
     SymbolicUtils.clear_cache!(occursin_info)
     SymbolicUtils.clear_cache!(recursive_hasoperator)
+    empty!(_exec_diff_cache())
 end
 
 """
@@ -212,6 +213,7 @@ Toggle caching in derivative related functions.
 function toggle_derivative_caching!(value::Bool) # public
     SymbolicUtils.toggle_caching!(occursin_info, value)
     SymbolicUtils.toggle_caching!(recursive_hasoperator, value)
+    _EXEC_DIFF_CACHE_ENABLED[] = value
 end
 
 """
@@ -252,6 +254,16 @@ function _occursin_info(x::BasicSymbolic{VartypeT}, expr::BasicSymbolic{VartypeT
     isie = is_scalar_indexed(expr)
 
     if SymbolicUtils.is_array_shape(shexpr)
+        # Fast path: an array-valued subexpression that mentions neither `x`
+        # itself nor, for a scalar index `x = arr[i]`, the parent array `arr`
+        # cannot contain `x` — report no occurrence instead of erroring.
+        # Anything else falls through to the conservative checks below: an
+        # extra occurrence is safe, a missing one corrupts.
+        if !SymbolicUtils.query(isequal(x), expr) &&
+            !(isix && (isequal(expr, arguments(x)[1]) ||
+                       SymbolicUtils.query(isequal(arguments(x)[1]), expr)))
+            return false
+        end
         fail && error("Differentiation with array expressions is not yet supported")
         if isix
             arr = arguments(x)[1]
@@ -529,7 +541,36 @@ passed differential and not any other Differentials it encounters.
 - `throw_no_derivative=false`: Whether to throw if a function with unknown
     derivative is encountered.
 """
-function executediff(D::Differential, arg::BasicSymbolic{VartypeT}; simplify=false, throw_no_derivative=false)
+# The symbolic equations of one system are a shared expression DAG, so
+# `executediff` is called over and over with the same `(D, arg)` pairs — both
+# within one `expand_derivatives` call and across the many calls of a Jacobian.
+# The derivative of an immutable expression node is deterministic: cache it so
+# each unique pair is differentiated once. The cache is task-local, which needs
+# no synchronization and bounds both staleness (e.g. derivative rules
+# registered mid-session) and memory growth to the task's lifetime; it is
+# emptied by `clear_derivative_caches!` and disabled by
+# `toggle_derivative_caching!`. Only the flag-free calls are cached, so a
+# caller that asks for `simplify` or `throw_no_derivative` semantics always
+# gets exactly that.
+const _EXEC_DIFF_CACHE_ENABLED = Ref(true)
+
+function _exec_diff_cache()
+    tls = task_local_storage()
+    cache = get(tls, :symbolics_exec_diff_cache, nothing)
+    cache === nothing || return cache
+    return tls[:symbolics_exec_diff_cache] = Dict{Tuple{Any, Any}, Any}()
+end
+
+function executediff(D::Differential, arg::BasicSymbolic{VartypeT}; simplify = false, throw_no_derivative = false)
+    if !simplify && !throw_no_derivative && _EXEC_DIFF_CACHE_ENABLED[]
+        return get!(_exec_diff_cache(), (D, arg)) do
+            _executediff(D, arg; simplify, throw_no_derivative)
+        end
+    end
+    return _executediff(D, arg; simplify, throw_no_derivative)
+end
+
+function _executediff(D::Differential, arg::BasicSymbolic{VartypeT}; simplify=false, throw_no_derivative=false)
     isinteger(D.order) || throw(ArgumentError("`executediff` requires integer derivative order."))
     order = floor(Int, D.order)
     if order > 1
@@ -1121,8 +1162,17 @@ function jacobian_sparsity(exprs::AbstractArray, vars::AbstractArray)
     # This rewriter notes down which u's appear in a
     # given du (whose index is stored in the `i` Ref)
 
+    # The expressions of one `du` share most of their subexpressions: record
+    # each visited node once per row so the traversal is linear in the number
+    # of unique subexpressions instead of exponential in the depth of the
+    # shared expression DAG. `seen` is reset per row — the same subtree must
+    # still be reported for every `du` it occurs in.
+    seen = Set{Tuple{Any, Bool}}()
     function r(x, is_indexee::Bool = false)
         if iscall(x)
+            key = (x, is_indexee)
+            key in seen && return
+            push!(seen, key)
             args = arguments(x)
             # A literal `arr[k]` is an element access, not a whole-array
             # occurrence; `arr` itself is an indexee and only contributes the
@@ -1161,6 +1211,7 @@ function jacobian_sparsity(exprs::AbstractArray, vars::AbstractArray)
 
     for ii = 1:length(du)
         i[] = ii
+        empty!(seen)
         r(du[ii])
     end
 
