@@ -1175,6 +1175,46 @@ end
     # `e` is a DAG of ~2n unique nodes whose tree expansion has ~2^n nodes. The
     # traversal used to visit every tree path (more than an hour at n = 30).
     @variables a b c d
+
+# The executediff memo is scoped to one top-level differentiation call.
+memo_f(x) = x^2
+@register_symbolic memo_f(x)
+struct MemoTestTag end
+@register_derivative memo_f(x) 1 2x
+@testset "executediff memo is scoped per top-level call" begin
+    @variables a b c
+    key = Symbolics._EXECDIFF_MEMO_KEY
+    Da = Differential(a)
+
+    # No memo outlives the call that created it.
+    @test isequal(expand_derivatives(Da(memo_f(a))), 2a)
+    @test !haskey(task_local_storage(), key)
+    Symbolics.jacobian([a * b, sin(a)], [a, b])
+    @test !haskey(task_local_storage(), key)
+
+    # A derivative rule registered between two calls is seen by the second.
+    @eval @register_derivative memo_f(x) 1 3x
+    @test isequal(expand_derivatives(Da(memo_f(a))), 3a)
+
+    # Nested calls share the outermost memo.
+    Symbolics.with_derivative_memo() do
+        memo = task_local_storage(key)
+        expand_derivatives(Da(a^2))
+        @test task_local_storage(key) === memo
+        @test !isempty(memo)
+    end
+    @test !haskey(task_local_storage(), key)
+
+    # Expressions that are isequal but differ in metadata are not conflated.
+    am = Symbolics.setmetadata(a, MemoTestTag, "tagged")
+    Symbolics.with_derivative_memo() do
+        r1 = expand_derivatives(Da(sin(a)))
+        r2 = expand_derivatives(Da(sin(am)))
+        @test isequal(r1, cos(a)) && isequal(r2, cos(am))
+        @test Symbolics.getmetadata(arguments(unwrap(r2))[1], MemoTestTag, nothing) == "tagged"
+    end
+
+    # A deep shared DAG is differentiated in linear time.
     e = a + b
     for _ in 1:30
         e = sin(e) + cos(e) * c
@@ -1182,4 +1222,19 @@ end
     t = @elapsed s = Symbolics.jacobian_sparsity([e, d, e * d], [a, b, c, d])
     @test Matrix(s) == Bool[1 1 1 0; 0 0 0 1; 1 1 1 1]
     @test t < 10
+
+    t = @elapsed d = expand_derivatives(Da(e))
+    @test t < 30
+    @test !SymbolicUtils._iszero(unwrap(d))
+
+    # Disabling derivative caching disables the memo.
+    Symbolics.toggle_derivative_caching!(false)
+    try
+        Symbolics.with_derivative_memo() do
+            @test !haskey(task_local_storage(), key)
+        end
+        @test isequal(expand_derivatives(Da(a^3)), 3a^2)
+    finally
+        Symbolics.toggle_derivative_caching!(true)
+    end
 end
