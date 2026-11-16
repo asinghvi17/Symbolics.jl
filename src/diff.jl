@@ -202,7 +202,6 @@ Clear caches of all cached functions involved in computing derivatives.
 function clear_derivative_caches!() # public
     SymbolicUtils.clear_cache!(occursin_info)
     SymbolicUtils.clear_cache!(recursive_hasoperator)
-    empty!(_exec_diff_cache())
 end
 
 """
@@ -213,7 +212,7 @@ Toggle caching in derivative related functions.
 function toggle_derivative_caching!(value::Bool) # public
     SymbolicUtils.toggle_caching!(occursin_info, value)
     SymbolicUtils.toggle_caching!(recursive_hasoperator, value)
-    _EXEC_DIFF_CACHE_ENABLED[] = value
+    _EXECDIFF_MEMO_ENABLED[] = value
 end
 
 """
@@ -541,33 +540,51 @@ passed differential and not any other Differentials it encounters.
 - `throw_no_derivative=false`: Whether to throw if a function with unknown
     derivative is encountered.
 """
-# The symbolic equations of one system are a shared expression DAG, so
-# `executediff` is called over and over with the same `(D, arg)` pairs — both
-# within one `expand_derivatives` call and across the many calls of a Jacobian.
-# The derivative of an immutable expression node is deterministic: cache it so
-# each unique pair is differentiated once. The cache is task-local, which needs
-# no synchronization and bounds both staleness (e.g. derivative rules
-# registered mid-session) and memory growth to the task's lifetime; it is
-# emptied by `clear_derivative_caches!` and disabled by
-# `toggle_derivative_caching!`. Only the flag-free calls are cached, so a
-# caller that asks for `simplify` or `throw_no_derivative` semantics always
-# gets exactly that.
-const _EXEC_DIFF_CACHE_ENABLED = Ref(true)
+# The symbolic equations of one system form a shared expression DAG, so
+# `executediff` is called over and over with the same `(D, arg)` pairs. That
+# happens within one `expand_derivatives` call and across the entries of a
+# Jacobian. Without a memo, differentiating a deep shared DAG is exponential.
+#
+# The memo lives only as long as one top-level differentiation call:
+# `with_derivative_memo` installs it in task-local storage and removes it on
+# return, and nested calls reuse the outermost memo. This means:
+# - it cannot go stale: derivative rules registered between two calls are seen;
+# - its memory is freed when the call returns;
+# - it is keyed by object identity (`D.x`, `arg`), so expressions that are
+#   `isequal` but carry different metadata are never conflated.
+const _EXECDIFF_MEMO_KEY = :__symbolics_executediff_memo__
+const _EXECDIFF_MEMO_ENABLED = Ref(true)
+# (D.x, D.order, simplify, throw_no_derivative) => (arg => derivative), by `===`.
+const _ExecDiffMemo = IdDict{Any, IdDict{SymbolicT, Any}}
 
-function _exec_diff_cache()
-    tls = task_local_storage()
-    cache = get(tls, :symbolics_exec_diff_cache, nothing)
-    cache === nothing || return cache
-    return tls[:symbolics_exec_diff_cache] = Dict{Tuple{Any, Any}, Any}()
+"""
+    with_derivative_memo(f)
+
+Call `f()` with an `executediff` memo installed, so every derivative that
+`f` computes shares one memo of `(Differential, subexpression)` results.
+Nested calls reuse the outermost memo, and the memo is dropped when the
+outermost call returns. `jacobian`, `sparsejacobian`, `gradient`, `hessian`,
+`derivative` and `expand_derivatives` already do this. Call it yourself to
+share the memo across several such calls on expressions with common
+subexpressions. Disabled by `toggle_derivative_caching!(false)`.
+"""
+function with_derivative_memo(f::F) where {F} # public
+    (_EXECDIFF_MEMO_ENABLED[] && !haskey(task_local_storage(), _EXECDIFF_MEMO_KEY)) || return f()
+    return task_local_storage(f, _EXECDIFF_MEMO_KEY, _ExecDiffMemo())
 end
 
+const _EXECDIFF_MISSING = gensym(:missing)
+
 function executediff(D::Differential, arg::BasicSymbolic{VartypeT}; simplify = false, throw_no_derivative = false)
-    if !simplify && !throw_no_derivative && _EXEC_DIFF_CACHE_ENABLED[]
-        return get!(_exec_diff_cache(), (D, arg)) do
-            _executediff(D, arg; simplify, throw_no_derivative)
-        end
+    _EXECDIFF_MEMO_ENABLED[] || return _executediff(D, arg; simplify, throw_no_derivative)
+    memo = get(task_local_storage(), _EXECDIFF_MEMO_KEY, nothing)
+    memo === nothing && return with_derivative_memo() do
+        executediff(D, arg; simplify, throw_no_derivative)
     end
-    return _executediff(D, arg; simplify, throw_no_derivative)
+    tbl = get!(IdDict{SymbolicT, Any}, memo::_ExecDiffMemo, (D.x, D.order, simplify, throw_no_derivative))
+    res = get(tbl, arg, _EXECDIFF_MISSING)
+    res === _EXECDIFF_MISSING || return res
+    return tbl[arg] = _executediff(D, arg; simplify, throw_no_derivative)
 end
 
 function _executediff(D::Differential, arg::BasicSymbolic{VartypeT}; simplify=false, throw_no_derivative=false)
@@ -847,6 +864,11 @@ julia> dfx = expand_derivatives(Dx(f))
 ```
 """
 function expand_derivatives(O::BasicSymbolic, simplify=false; throw_no_derivative=false)
+    with_derivative_memo() do
+        _expand_derivatives(O, simplify; throw_no_derivative)
+    end
+end
+function _expand_derivatives(O::BasicSymbolic, simplify; throw_no_derivative)
     @match O begin
         BSImpl.Term(; f, args) && if f isa Union{Differential, Grad{false}, Divergence{false}, Curl{false}} end => begin
             if f isa Differential && iscall(args[1]) &&
@@ -955,7 +977,9 @@ All other keyword arguments are forwarded to `expand_derivatives`.
 """
 function derivative(O, var; simplify=false, kwargs...)
     if O isa AbstractArray
-        Num[Num(expand_derivatives(Differential(var)(unwrap(o)), simplify; kwargs...)) for o in O]
+        with_derivative_memo() do
+            Num[Num(expand_derivatives(Differential(var)(unwrap(o)), simplify; kwargs...)) for o in O]
+        end
     else
         Num(expand_derivatives(Differential(var)(unwrap(O)), simplify; kwargs...))
     end
@@ -976,7 +1000,9 @@ an array of variable expressions.
 All other keyword arguments are forwarded to `expand_derivatives`.
 """
 function gradient(O, vars::AbstractVector; simplify=false, kwargs...)
-    Num[Num(expand_derivatives(Differential(vars[vi])(unwrap(O)),simplify; kwargs...)) for vi in eachindex(vars)]
+    with_derivative_memo() do
+        Num[Num(expand_derivatives(Differential(vars[vi])(unwrap(O)),simplify; kwargs...)) for vi in eachindex(vars)]
+    end
 end
 
 """
@@ -1001,12 +1027,14 @@ function jacobian(ops::AbstractVector, vars::AbstractVector{SymbolicT};
     # Pre-compute variable sets to skip differentiating trivially zero Jacobian entries.
     op_varsets = map(op -> _augment_with_call_args!(SymbolicUtils.search_variables(op)), ops)
     result = fill(COMMON_ZERO, length(ops), length(vars))
-    for i in eachindex(ops), j in eachindex(vars)
-        v = vars[j]
-        # `arr[k]` also occurs when the lazy array `arr` is in the variable set.
-        (v in op_varsets[i] ||
-            (is_scalar_indexed(v) && (arguments(v)[1] in op_varsets[i]))) || continue
-        result[i, j] = executediff(Differential(v), ops[i]; simplify, kwargs...)
+    with_derivative_memo() do
+        for i in eachindex(ops), j in eachindex(vars)
+            v = vars[j]
+            # `arr[k]` also occurs when the lazy array `arr` is in the variable set.
+            (v in op_varsets[i] ||
+                (is_scalar_indexed(v) && (arguments(v)[1] in op_varsets[i]))) || continue
+            result[i, j] = executediff(Differential(v), ops[i]; simplify, kwargs...)
+        end
     end
     return result
 end
@@ -1098,8 +1126,10 @@ function sparsejacobian_vals(ops::AbstractVector, vars::AbstractVector, I::Abstr
     exprs = Num[]
     sizehint!(exprs, length(I))
 
-    for (i,j) in zip(I, J)
-        push!(exprs, Num(expand_derivatives(Differential(vars[j])(ops[i]), simplify; kwargs...)))
+    with_derivative_memo() do
+        for (i,j) in zip(I, J)
+            push!(exprs, Num(expand_derivatives(Differential(vars[j])(ops[i]), simplify; kwargs...)))
+        end
     end
     exprs
 end
@@ -1280,6 +1310,11 @@ an array of variable expressions.
 All other keyword arguments are forwarded to `expand_derivatives`.
 """
 function hessian(O, vars::AbstractVector; simplify=false, kwargs...)
+    with_derivative_memo() do
+        _hessian(O, vars; simplify, kwargs...)
+    end
+end
+function _hessian(O, vars::AbstractVector; simplify, kwargs...)
     vars = map(value, vars)
     first_derivs = map(value, vec(jacobian([values(O)], vars; simplify=simplify, kwargs...)))
     n = length(vars)
@@ -1490,14 +1525,16 @@ function sparsehessian_vals(op, vars::AbstractVector, I::AbstractVector, J::Abst
 
     prev_j = 0
     d = nothing
-    for (k, (i, j)) in enumerate(zip(I, J))
-        j > i && continue
-        if j != prev_j
-            d = expand_derivatives(Differential(vars[j])(op), false; kwargs...)
+    with_derivative_memo() do
+        for (k, (i, j)) in enumerate(zip(I, J))
+            j > i && continue
+            if j != prev_j
+                d = expand_derivatives(Differential(vars[j])(op), false; kwargs...)
+            end
+            expr = expand_derivatives(Differential(vars[i])(d), simplify; kwargs...)
+            exprs[k] = expr
+            prev_j = j
         end
-        expr = expand_derivatives(Differential(vars[i])(d), simplify; kwargs...)
-        exprs[k] = expr
-        prev_j = j
     end
     exprs
 end
