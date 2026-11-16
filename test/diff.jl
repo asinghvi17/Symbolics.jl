@@ -279,7 +279,12 @@ end
 @variables x y
 @register_symbolic foo(x, y, z::Array)
 D = Differential(x)
-@test_throws ErrorException expand_derivatives(D(foo(x, y, [1.2]) * x^2))
+# The constant array argument cannot depend on `x`, so it no longer trips the
+# "array expressions" error: the product rule applies, leaving `D(foo(...))`
+# unexpanded because `foo` has no registered derivative.
+let ex = foo(x, y, [1.2])
+    @test isequal(expand_derivatives(D(ex * x^2)), 2ex * x + D(ex) * x^2)
+end
 
 @variables t x(t) y(t)
 D = Differential(t)
@@ -1153,4 +1158,16 @@ let
     @test sprint(show, Divergence{false}(x)(y)) == "∇⋅(y)"
     @test occursin("∇(a^2 + b^2)", sprint(show, grad))
     @test occursin("∇×(y)", sprint(show, ∇ × y))
+end
+
+@testset "occursin_info: array subexpressions that cannot contain the variable" begin
+    # An array-valued subexpression (here `p'p`) reached with `fail = true` used
+    # to error unconditionally. When it mentions neither the variable nor, for a
+    # scalar index `v = arr[i]`, the parent array, it cannot contain `v`.
+    @variables x p[1:3] q[1:3]
+    @test isequal(expand_derivatives(Differential(x)(x * (p'p))), unwrap(p'p))
+    @test isequal(expand_derivatives(Differential(x)(x * (p'p) + x^2)), unwrap(p'p + 2x))
+    @test iszero(unwrap_const(expand_derivatives(Differential(p[1])(x * (q'q)))))
+    # An array subexpression that does mention the variable is still unsupported.
+    @test_throws ErrorException expand_derivatives(Differential(p[1])(x * (p'p)))
 end
