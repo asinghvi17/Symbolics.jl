@@ -1170,4 +1170,16 @@ end
     @test iszero(unwrap_const(expand_derivatives(Differential(p[1])(x * (q'q)))))
     # An array subexpression that does mention the variable is still unsupported.
     @test_throws ErrorException expand_derivatives(Differential(p[1])(x * (p'p)))
+
+@testset "jacobian_sparsity is linear in the shared expression DAG" begin
+    # `e` is a DAG of ~2n unique nodes whose tree expansion has ~2^n nodes. The
+    # traversal used to visit every tree path (more than an hour at n = 30).
+    @variables a b c d
+    e = a + b
+    for _ in 1:30
+        e = sin(e) + cos(e) * c
+    end
+    t = @elapsed s = Symbolics.jacobian_sparsity([e, d, e * d], [a, b, c, d])
+    @test Matrix(s) == Bool[1 1 1 0; 0 0 0 1; 1 1 1 1]
+    @test t < 10
 end
