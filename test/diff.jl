@@ -1154,3 +1154,16 @@ let
     @test occursin("∇(a^2 + b^2)", sprint(show, grad))
     @test occursin("∇×(y)", sprint(show, ∇ × y))
 end
+
+@testset "jacobian_sparsity is linear in the shared expression DAG" begin
+    # `e` is a DAG of ~2n unique nodes whose tree expansion has ~2^n nodes. The
+    # traversal used to visit every tree path (more than an hour at n = 30).
+    @variables a b c d
+    e = a + b
+    for _ in 1:30
+        e = sin(e) + cos(e) * c
+    end
+    t = @elapsed s = Symbolics.jacobian_sparsity([e, d, e * d], [a, b, c, d])
+    @test Matrix(s) == Bool[1 1 1 0; 0 0 0 1; 1 1 1 1]
+    @test t < 10
+end
