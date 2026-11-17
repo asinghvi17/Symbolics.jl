@@ -426,7 +426,7 @@ end
 function symbolic_callable_diff(D::Differential, arg::BasicSymbolic{VartypeT}, inner_args::SymbolicUtils.ROArgsT{VartypeT}; kw...)
     partials = Union{Nothing, SymbolicT}[derivative_idx(arg, i) for i in eachindex(inner_args)]
     for (t, a) in zip(partials, inner_args)
-        t === nothing && occursin_info(D.x, a) && return nothing
+        t === nothing && derivative_depends_on(D, a) && return nothing
     end
     summed_args = SymbolicUtils.ArgsT{VartypeT}()
     sizehint!(summed_args, length(inner_args))
@@ -511,6 +511,69 @@ alike here.
 _iszero_derivative(x) = _iszero(x) || is_symbolic_zero(x)
 
 """
+    total_derivative(f, args, D::Differential)
+
+Return the declared total derivative of the call `f(args...)` with respect to `D.x`,
+or `nothing` to use the usual derivative rules. The default is `nothing`.
+
+Packages may specialize this function on their own function or callable type. `args`
+is a read-only collection of unwrapped symbolic arguments and `D` is first-order.
+Return a symbolic expression (optionally wrapped in `Num`) or a number. Return
+`nothing` for differentiation variables the method does not handle. Methods should
+be pure: expansion may consult them more than once.
+
+[`expand_derivatives`](@ref) consults this hook before checking whether the call
+depends on `D.x` and before applying the chain rule. Derivatives in the returned
+expression are expanded recursively; higher-order and mixed derivatives then
+differentiate that expression normally. Partial derivative rules registered with
+[`@register_derivative`](@ref) remain available when the hook returns `nothing`.
+
+Every `Differential(t)` consults the hook, including uses intended as a partial
+derivative with respect to `t`: `jacobian([f(args...)], [t])` and ModelingToolkit's
+`tgrad` use the declared value too. Define hooks only where these semantics are
+intended. Mixed derivatives need not commute when a hook is used.
+
+Do not return `D(f(args...))` for the same call: recursively expanding that result
+invokes the hook again and recurses forever.
+"""
+@inline total_derivative(f, args, D) = nothing
+
+# Cache the method-table check until the world changes. Once an extension exists,
+# keep checking expressions, including ones cached before that extension loaded.
+# A monotonic atomic update also makes concurrent first checks safe.
+const TOTAL_DERIVATIVE_WORLD = Threads.Atomic{UInt}(0)
+
+@inline function has_total_derivative_methods()
+    checked_world = TOTAL_DERIVATIVE_WORLD[]
+    checked_world == typemax(UInt) && return true
+    world = Base.get_world_counter()
+    checked_world == world && return false
+    enabled = length(methods(total_derivative)) > 1
+    Threads.atomic_max!(TOTAL_DERIVATIVE_WORLD, enabled ? typemax(UInt) : world)
+    return enabled
+end
+
+# A declared derivative can introduce dependence absent from the call's arguments.
+# Keep this check outside the structural occurrence cache so newly loaded methods
+# also apply to expressions which have already been differentiated.
+@inline function derivative_depends_on(D::Differential, arg::SymbolicT)
+    return occursin_info(D.x, arg) ||
+           (has_total_derivative_methods() && has_total_derivative(D, arg))
+end
+
+@inline function has_total_derivative(D::Differential, arg::SymbolicT)
+    iscall(arg) || return false
+    @match arg begin
+        BSImpl.Term(; f, args) => total_derivative(f, args, D) === nothing || return true
+        _ => nothing
+    end
+    for a in arguments(arg)
+        iscall(a) && has_total_derivative(D, a) && return true
+    end
+    return false
+end
+
+"""
     executediff(D, arg; simplify=false, occurrences=nothing)
 
 Apply the passed Differential D on the passed argument.
@@ -539,6 +602,15 @@ function executediff(D::Differential, arg::BasicSymbolic{VartypeT}; simplify=fal
         return arg
     end
     isequal(arg, D.x) && return COMMON_ONE
+    @match arg begin
+        BSImpl.Term(; f, args) => begin
+            der = total_derivative(f, args, D)
+            if der !== nothing
+                return expand_derivatives(SConst(unwrap(der)), simplify; throw_no_derivative)
+            end
+        end
+        _ => nothing
+    end
     @match arg begin
         BSImpl.Term(; f, args, shape) && if f === (*) && length(args) == 2 && isempty(shape) end => begin
             @match args[1] begin
@@ -592,7 +664,7 @@ function executediff(D::Differential, arg::BasicSymbolic{VartypeT}; simplify=fal
         end
         _ => nothing
     end
-    occursin_info(D.x, arg) || return differential_zero(arg)
+    derivative_depends_on(D, arg) || return differential_zero(arg)
 
     # We can safely assume `arg` is scalar, else `occursin_info` would have errored.
     @match arg begin
@@ -705,7 +777,7 @@ function executediff(D::Differential, arg::BasicSymbolic{VartypeT}; simplify=fal
                 summed_args = SymbolicUtils.ArgsT{VartypeT}()
 
                 for (i, iarg) in enumerate(inner_args)
-                    occursin_info(D.x, iarg) || continue #skip if inner arg doesn't need this var
+                    derivative_depends_on(D, iarg) || continue #skip if inner arg doesn't need this var
                     t2 = executediff(D, iarg; simplify, throw_no_derivative)::SymbolicT
                     _iszero_derivative(t2) && continue
                     t = derivative_idx(arg, i)::Union{Nothing, SymbolicT}
@@ -952,19 +1024,22 @@ an array of variable expressions.
 All other keyword arguments are forwarded to `expand_derivatives`.
 """
 function jacobian(ops::AbstractVector, vars::AbstractVector{SymbolicT};
-                  simplify=false, scalarize::Union{Val{true}, Val{false}}=Val(true), kwargs...)
+        simplify = false, scalarize::Union{Val{true}, Val{false}} = Val(true), kwargs...)
     if scalarize isa Val{true}
         ops = Symbolics.scalarize(ops)
         vars = Symbolics.scalarize(vars)
     end
     # Pre-compute variable sets to skip differentiating trivially zero Jacobian entries.
     op_varsets = map(op -> _augment_with_call_args!(SymbolicUtils.search_variables(op)), ops)
+    # Declared derivatives can depend on variables absent from these structural sets.
+    has_declared_derivatives = has_total_derivative_methods()
     result = fill(COMMON_ZERO, length(ops), length(vars))
     for i in eachindex(ops), j in eachindex(vars)
+
         v = vars[j]
         # `arr[k]` also occurs when the lazy array `arr` is in the variable set.
-        (v in op_varsets[i] ||
-            (is_scalar_indexed(v) && (arguments(v)[1] in op_varsets[i]))) || continue
+        (has_declared_derivatives || v in op_varsets[i] ||
+         (is_scalar_indexed(v) && (arguments(v)[1] in op_varsets[i]))) || continue
         result[i, j] = executediff(Differential(v), ops[i]; simplify, kwargs...)
     end
     return result
