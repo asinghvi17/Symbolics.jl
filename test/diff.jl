@@ -26,6 +26,34 @@ pos(s, v) = s
     @test isequal(Symbolics.jacobian([pos(s, v)], [s, v]), [1 0])
 end
 
+const total_derivative_probe_visits = IdDict{Any, Int}()
+total_derivative_probe(x) = x
+@register_symbolic total_derivative_probe(x)
+function Symbolics.total_derivative(::typeof(total_derivative_probe), args, D)
+    visits = total_derivative_probe_visits
+    visits[args[1]] = get(visits, args[1], 0) + 1
+    return nothing
+end
+
+@testset "Total derivative hook on a shared DAG" begin
+    @variables dag_x dag_y
+    e = dag_x^2 + 1
+    nodes = IdDict{Any, Nothing}()
+    for _ in 1:12
+        nodes[unwrap(e)] = nothing
+        p = total_derivative_probe(e)
+        e = sin(p) * cos(p)
+    end
+    empty!(total_derivative_probe_visits)
+    for query in 1:2
+        @test iszero(Symbolics.derivative(e, dag_y))
+        @test length(total_derivative_probe_visits) == length(nodes) == 12
+        counts = [get(total_derivative_probe_visits, node, 0) for node in keys(nodes)]
+        @test counts == fill(query, 12)
+    end
+    empty!(total_derivative_probe_visits)
+end
+
 # Derivatives
 @variables t σ ρ β
 @variables x y z
