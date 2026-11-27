@@ -562,13 +562,19 @@ end
 end
 
 @inline function has_total_derivative(D::Differential, arg::SymbolicT)
+    return has_total_derivative(D, arg, Base.IdSet{SymbolicT}())
+end
+
+function has_total_derivative(D::Differential, arg::SymbolicT, visited::Base.IdSet{SymbolicT})
     iscall(arg) || return false
+    arg in visited && return false
+    push!(visited, arg)
     @match arg begin
         BSImpl.Term(; f, args) => total_derivative(f, args, D) === nothing || return true
         _ => nothing
     end
     for a in arguments(arg)
-        iscall(a) && has_total_derivative(D, a) && return true
+        iscall(a) && has_total_derivative(D, a, visited) && return true
     end
     return false
 end
